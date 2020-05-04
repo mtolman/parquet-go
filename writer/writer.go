@@ -33,11 +33,13 @@ type ParquetWriter struct {
 	ObjSize           int64
 	CheckSizeCritical int64
 
-	PagesMapBuf map[string][]*layout.Page
-	Size        int64
-	NumRows     int64
+	PagesMapMutex sync.Mutex
+	PagesMapBuf   map[string][]*layout.Page
+	Size          int64
+	NumRows       int64
 
-	DictRecs map[string]*layout.DictRecType
+	DictRecsMutex sync.Mutex
+	DictRecs      map[string]*layout.DictRecType
 
 	MarshalFunc func(src []interface{}, bgn int, end int, sh *schema.SchemaHandler) (*map[string]*layout.Table, error)
 }
@@ -61,7 +63,7 @@ func NewParquetWriter(pFile source.ParquetFile, obj interface{}, np int64) (*Par
 	res.DictRecs = make(map[string]*layout.DictRecType)
 	res.Footer = parquet.NewFileMetaData()
 	res.Footer.Version = 1
-	//include the createdBy to avoid 
+	//include the createdBy to avoid
 	//WARN  CorruptStatistics:118 - Ignoring statistics because created_by is null or empty! See PARQUET-251 and PARQUET-297
 	createdBy := "parquet-go version latest"
 	res.Footer.CreatedBy = &createdBy
@@ -187,7 +189,6 @@ func (self *ParquetWriter) flushObjs() error {
 
 	var c int64 = 0
 	delta := (l + self.NP - 1) / self.NP
-	lock := new(sync.Mutex)
 	var wg sync.WaitGroup
 	for c = 0; c < self.NP; c++ {
 		bgn := c * delta
@@ -225,13 +226,13 @@ func (self *ParquetWriter) flushObjs() error {
 				for name, table := range *tableMap {
 					if table.Info.Encoding == parquet.Encoding_PLAIN_DICTIONARY ||
 						table.Info.Encoding == parquet.Encoding_RLE_DICTIONARY {
-						lock.Lock()
+						self.DictRecsMutex.Lock()
 						if _, ok := self.DictRecs[name]; !ok {
 							self.DictRecs[name] = layout.NewDictRec(*table.Schema.Type)
 						}
 						pagesMapList[index][name], _ = layout.TableToDictDataPages(self.DictRecs[name],
 							table, int32(self.PageSize), 32, self.CompressionType)
-						lock.Unlock()
+						self.DictRecsMutex.Unlock()
 
 					} else {
 						pagesMapList[index][name], _ = layout.TableToDataPages(table, int32(self.PageSize),
@@ -249,11 +250,13 @@ func (self *ParquetWriter) flushObjs() error {
 
 	for _, pagesMap := range pagesMapList {
 		for name, pages := range pagesMap {
+			self.PagesMapMutex.Lock()
 			if _, ok := self.PagesMapBuf[name]; !ok {
 				self.PagesMapBuf[name] = pages
 			} else {
 				self.PagesMapBuf[name] = append(self.PagesMapBuf[name], pages...)
 			}
+			self.PagesMapMutex.Unlock()
 			for _, page := range pages {
 				self.Size += int64(len(page.RawData))
 				page.DataTable = nil //release memory
@@ -276,18 +279,25 @@ func (self *ParquetWriter) Flush(flag bool) error {
 	if (self.Size+self.ObjsSize >= self.RowGroupSize || flag) && len(self.PagesMapBuf) > 0 {
 		//pages -> chunk
 		chunkMap := make(map[string]*layout.Chunk)
+		self.PagesMapMutex.Lock()
 		for name, pages := range self.PagesMapBuf {
-			if len(pages) > 0 && (pages[0].Info.Encoding == parquet.Encoding_PLAIN_DICTIONARY || pages[0].Info.Encoding == parquet.Encoding_RLE_DICTIONARY) {
-				dictPage, _ := layout.DictRecToDictPage(self.DictRecs[name], int32(self.PageSize), self.CompressionType)
-				tmp := append([]*layout.Page{dictPage}, pages...)
-				chunkMap[name] = layout.PagesToDictChunk(tmp)
-			} else {
-				chunkMap[name] = layout.PagesToChunk(pages)
-
+			if len(pages) > 0 {
+				if pages[0].Info.Encoding == parquet.Encoding_PLAIN_DICTIONARY || pages[0].Info.Encoding == parquet.Encoding_RLE_DICTIONARY {
+					self.DictRecsMutex.Lock()
+					dictPage, _ := layout.DictRecToDictPage(self.DictRecs[name], int32(self.PageSize), self.CompressionType)
+					self.DictRecsMutex.Unlock()
+					tmp := append([]*layout.Page{dictPage}, pages...)
+					chunkMap[name] = layout.PagesToDictChunk(tmp)
+				} else {
+					chunkMap[name] = layout.PagesToChunk(pages)
+				}
 			}
 		}
+		self.PagesMapMutex.Unlock()
 
+		self.DictRecsMutex.Lock()
 		self.DictRecs = make(map[string]*layout.DictRecType) //clean records for next chunks
+		self.DictRecsMutex.Unlock()
 
 		//chunks -> rowGroup
 		rowGroup := layout.NewRowGroup()
@@ -332,7 +342,9 @@ func (self *ParquetWriter) Flush(flag bool) error {
 		}
 		self.Footer.RowGroups = append(self.Footer.RowGroups, rowGroup.RowGroupHeader)
 		self.Size = 0
+		self.PagesMapMutex.Lock()
 		self.PagesMapBuf = make(map[string][]*layout.Page)
+		self.PagesMapMutex.Unlock()
 	}
 	self.Footer.NumRows += int64(len(self.Objs))
 	self.Objs = self.Objs[:0]
